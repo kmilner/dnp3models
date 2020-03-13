@@ -1,0 +1,877 @@
+
+
+theory DNP3
+begin
+/*********************************************************
+* ===============================
+*  DNP3 Secure Authentication v5
+* ===============================
+* 
+* Author: Martin Dehnel-Wild and Kevin Milner
+* Date: Apr 2017
+* Status: Complete
+* 
+*********************************************************/
+
+builtins: hashing, symmetric-encryption
+
+functions: hmac/2
+
+//restriction Eq_testing: "All x y #i. Eq( x, y ) @ i ==> x = y"
+ 
+restriction InEq_testing: "All x y #i. InEq( x, y ) @ i ==> not( x = y )"
+restriction Unique_Pairings_id: 
+    "All x #i #j. Unique( x ) @ i & Unique( x ) @ j ==> #i = #j"
+// This enforces that x and y are of distinct 'types': specifically in this case,
+//  no outstation ID will end up being used as a user ID and vice versa
+restriction USR_and_OutstationID_distinct: "All x y #i. Distinct( x, y ) @ i 
+    ==> not( Ex #j z. Distinct( y, z ) @ j ) & not( Ex #j z. Distinct( z, x ) @ j )"
+
+/*********************************************************
+ * Adversary Rules
+ *********************************************************/
+
+rule Update_key_reveal:
+    [ !UpdateKeyToReveal( ~linkid, k ) ]
+  --[ UpdateKeyReveal( k ), AdversaryRule( 'Update_key_reveal' ) ]->
+    [ Out( k ) ]
+
+rule cdsk_reveal:
+    [ !CDSKToReveal( k1 ) ]
+  --[ CDSKReveal( k1), AdversaryRule( 'Update_key_reveal' ) ]->
+    [ Out( k1 ) ]
+
+rule mdsk_reveal:
+    [ !MDSKToReveal( k1 ) ]
+  --[ MDSKReveal( k1 ), AdversaryRule( 'Update_key_reveal' ) ]->
+    [ Out( k1 ) ]
+
+rule authority_key_reveal:
+    [ !F_AuthorityKey(k1 ) ]
+  --[ AuthorityKeyReveal( k1 ), AdversaryRule( 'Update_key_reveal' ) ]->
+    [ Out( k1 ) ]
+
+/*********************************************************
+ * Auxiliary Rules
+ *********************************************************/
+
+// The Authority's single point of key generation.
+rule Authority_Key:
+    [ Fr( ~AK ) ]
+  --[ ]->
+    [ !F_AuthorityKey(~AK ) ]
+
+
+// L_Counter() rule. We say that 1+1 = h(1) (e.g. successor function).
+rule CountUp:
+    [ L_Counter(~id,val )
+        ]
+  --[ NewCounterValue( ~id, h( val ) ) ]->
+    [ L_Counter(~id,h( val ) )
+    , L_CounterValue(~id,h( val ) )
+    , Out( h( val ) ) // Just so we can be sure counters are public
+        ]
+
+
+/*********************************************************
+ * Initial Setup
+ *********************************************************/
+
+rule Initial_key_pre_distribution:
+    let invars = <~AK,$USR,$OUTSTATION,~linkid>
+        skinvars = <~skid,'NOT_INIT', 'undefined', 'undefined'>
+        ukinvars = <~ukid, ~UK>
+        chal     = <~cid, ~skid, 'none'>
+    in
+    [ !F_AuthorityKey(~AK ) // Receive Authority Key securely.
+    , Fr( ~UK )     // Generate first Update Key, between USR and Outstation
+    , Fr( ~uid ), Fr( ~oid ) // State invariant identifiers
+	, Fr(~cid) // Identifier for the challenge invariants
+    , Fr( ~linkid )     // The unique link identifier between user and outstation
+    , Fr(~skid), Fr(~ukid) //Identifier for session key and update key invariant
+        ]
+  --[ // The association of user number to outstation is unique *per authority key*. 
+      Unique( < ~AK, $USR, $OUTSTATION > )
+    , Unique( < ~AK, $OUTSTATION, $USR > )
+    , Distinct( $USR, $OUTSTATION )
+
+    , NewCounterValue( ~uid, '0' ), NewCounterValue( ~oid, '0' )
+    , NewUpdateKey( ~linkid, ~UK )
+    
+    , U_InvariantSource(~uid, invars)
+    , O_InvariantSource(~oid, invars)
+    , InvariantSource1(<~uid,'uk'>,ukinvars),InvariantSource2(<~uid,'uk'>,ukinvars)
+    , InvariantSource1(<~oid,'uk'>,ukinvars),InvariantSource2(<~oid,'uk'>,ukinvars)
+    , InvariantSource1(<~uid,'sk'>,skinvars),InvariantSource2(<~uid,'sk'>,skinvars)
+    , InvariantSource1(<~oid,'sk'>,skinvars),InvariantSource2(<~oid,'sk'>,skinvars)
+    , InvariantSource1(<~uid,'c'>,chal),InvariantSource2(<~uid,'c'>,chal)
+    , InvariantSource1(<~oid,'c'>,chal),InvariantSource2(<~oid,'c'>,chal)
+    , InvariantSource1(<~uid,'m'>,chal),InvariantSource2(<~uid,'m'>,chal)
+    , InvariantSource1(<~oid,'m'>,chal),InvariantSource2(<~oid,'m'>,chal)
+    ]->
+    [ UserState( ~uid, invars,  ukinvars, skinvars,
+                    <'0', chal>, <'0', chal>, 'Init' )
+    , OutstationState( ~oid, invars, '0', ukinvars, skinvars,
+                    <'0', chal>, <'0', chal>, 'SecurityIdle' )
+
+    // This is the last key status message, which the outstation is expected
+    //  to accept key changes on, even if things have happened since it was sent
+    , OutSentKeyStatus( ~oid, invars, skinvars, 'none' )
+
+    // These are the counter facts, which will go into a special 'count up' rule
+    //  so we can easily prove monotonicity (and uniqueness) of counter values
+    , L_Counter(~uid,'0' ), L_Counter(~oid,'0' )
+
+    , !F_UpdateKey(~linkid,~UK )   // For e.g. adversary key-reveal events
+    ]
+
+/********************************************************************************
+ * Session Key Update Protocol
+ ********************************************************************************/
+
+/*********************************************************
+ * Send `Session Key Status Request' (g120v4)
+ * Sent by User
+ *********************************************************/
+
+rule S1_SKSR_session_key_status_request:
+    let invars = <~AK,$USR,$OUTSTATION,~linkid> 
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal> , <mCSQ, mChal>, anystate )[-]
+        ]
+  --[ U_Invariant(~id, invars)
+    , L_Invariant(<~id, 'sk'>, skinvars)
+    , L_Invariant(<~id, 'uk'>, ukinvars)
+    , L_Invariant(<~id, 'c'>, cChal)
+    , L_Invariant(<~id, 'm'>, mChal)
+    ]->
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal> , <mCSQ, mChal>, 'SessionKeyChange' )
+    , Out( $USR )
+    ]
+
+/*********************************************************
+ * Send `Session Key Status' Message (g120v5)
+ * Sent by Outstation
+ *********************************************************/
+
+rule S2_SKS_session_key_status:
+    let invars = <~AK,$USR,$OSID,~linkid>
+        skinvars = <~skid,$keystatus, CDSK, MDSK>
+        SKSM_j = < h( KSQ ), $USR, $keystatus, ~CD_j >
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal> , <mCSQ, mChal>, 'SecurityIdle' )[-]
+    , OutSentKeyStatus( ~id, invars, skinvars, lastkeystatus )[-]
+    , Fr( ~CD_j )
+    , In( $USR )
+        ]
+  --[ O_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id, 'uk'>, ukinvars)
+    , L_Invariant(<~id, 'c'>, cChal)
+    , L_Invariant(<~id, 'm'>, mChal)
+    ]->
+    [ OutstationState( ~id, invars, h( KSQ ), ukinvars, skinvars,
+                        <cCSQ, cChal> , <mCSQ, mChal>, 'SecurityIdle' )
+    , OutSentKeyStatus( ~id,invars, skinvars,  SKSM_j )
+    , Out( SKSM_j )
+    ]
+
+/*********************************************************
+ * Send `Session Key Change' Message (g120v6)
+ * Sent by User
+ **********************************************************/
+
+rule S3_SKC_session_key_change:
+    let invars = <~AK,$USR,$OSID,~linkid>
+        ukinvars = <~ukid,UK>
+        newskinvars = <~skid,'OK', ~CDSK, ~MDSK>
+        SKSM_j = < KSQ, $USR, $keystatus, CD_j >
+        SKCM_j = < KSQ, $USR,
+             senc( < ~CDSK, ~MDSK, SKSM_j >, UK) > in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal> , <mCSQ, mChal>, 'SessionKeyChange' )[+]
+    , Fr( ~CDSK ), Fr( ~MDSK ) // The new session keys
+    , Fr( ~skid )
+    , In( SKSM_j )
+        ]
+  --[ NewSKs( ~linkid, UK, ~CDSK, ~MDSK )
+    , Sourced_UpdateKey( ~linkid, UK )
+    , UpdateKeyUsedForSKs( ~linkid, UK, ~CDSK, ~MDSK )
+
+    , U_Invariant(~id, invars)
+    , InvariantSource1(<~id,'sk'>,newskinvars)
+    , InvariantSource2(<~id,'sk'>,newskinvars)
+    , Invariant(<~id,'uk'>,ukinvars),L_Invariant(<~id,'uk'>,ukinvars)
+    , L_Invariant(<~id, 'c'>, cChal)
+    , L_Invariant(<~id, 'm'>, mChal)
+    ]->
+    [ UserState( ~id, invars, ukinvars, newskinvars, <cCSQ, cChal> , <mCSQ, mChal>, 
+                    < 'WaitForKeyChangeConfirmation', SKCM_j, ~CDSK, ~MDSK > )
+    , !CDSKToReveal( ~CDSK )
+    , !MDSKToReveal( ~MDSK )
+    , Out( SKCM_j )
+    ]
+
+/*********************************************************
+ * Send another `Session Key Status' Message' (g120v5)
+ * Sent by Outstation
+ *********************************************************/
+
+rule S4_SKS_session_key_status:
+    let invars = <~AK,$USR,$OSID,~linkid>
+        ukinvars = <~ukid,UK>
+        newskinvars = <~skid,'OK', CDSK, MDSK>
+        newChal = <~cid, ~skid, 'none'>
+        SKSM_j =  < KSQ, $USR, $keystatus, CD_j >
+        SKCM_j =  < KSQ, $USR, senc( < CDSK, MDSK, SKSM_j >, UK ) >
+        SKSM_j_plus_1 = < h( KSQ ), $USR, 'OK', ~CD_j_plus_1,
+                          hmac( SKCM_j, MDSK ) >
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        < cCSQ, cChal >, < mCSQ, cChal >, 'SecurityIdle' )[-]
+    , L_CounterValue(~id,h( cCSQ ) )
+    , OutSentKeyStatus( ~id, invars, skinvars, SKSM_j )[-]
+    , Fr( ~CD_j_plus_1 )
+	, Fr(~cid)
+    , Fr(~skid)
+    , In( SKCM_j )
+        ]
+  --[ CSQ( ~id, h( cCSQ ) )
+    , Sourced_UpdateKey( ~linkid, UK )
+    , Sourced_SKs( ~linkid, UK, CDSK, MDSK )
+    , UpdateKeyUsedForSKs( ~linkid, UK, CDSK, MDSK )
+
+    , O_Invariant(~id, invars)
+    , InvariantSource1(<~id,'sk'>,newskinvars)
+    , InvariantSource2(<~id,'sk'>,newskinvars)
+    , Invariant(<~id,'uk'>,ukinvars),L_Invariant(<~id,'uk'>,ukinvars)
+    , InvariantSource1(<~id,'c'>,newChal),InvariantSource2(<~id,'c'>,newChal)
+    , InvariantSource1(<~id,'m'>,newChal),InvariantSource2(<~id,'m'>,newChal)
+    ]->
+    [ // Drop last challenge on key update
+      OutstationState( ~id, invars, h( KSQ ), ukinvars, newskinvars,
+                        <h(cCSQ), newChal> , <h(mCSQ), newChal>, 'SecurityIdle' )
+    , OutSentKeyStatus( ~id, invars, newskinvars, SKSM_j_plus_1 )
+    , Out( SKSM_j_plus_1 )
+    ]
+
+/*********************************************************
+ * User receive SKS confirmation message from Outstation
+ *********************************************************/
+
+rule S5_receive_SKS_confirmation: 
+    let invars = <~AK,$USR,$OSID,~linkid>
+        ukinvars = <~ukid,UK>
+        skinvars = <~skid,'OK', CDSK, MDSK>
+        newChal = <~cid, ~skid, 'none'>
+        SKSM_j_plus_1 = < KSQ, $USR, 'OK', CD_j_plus_1,
+                           hmac( SKCM_j, MDSK ) >
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars, < cCSQ, cChal >, < mCSQ, cChal >,
+                    < 'WaitForKeyChangeConfirmation', SKCM_j, CDSK, MDSK > )[+]
+    , L_CounterValue(~id,h( mCSQ ) )
+    , Fr( ~cid )
+    , In( SKSM_j_plus_1 )
+    ]
+  --[ CSQ( ~id, h( mCSQ ) )
+
+    , U_Invariant(~id, invars)
+    , L_Invariant(<~id, 'sk'>, skinvars)
+    , L_Invariant(<~id, 'uk'>, ukinvars)
+    , InvariantSource1(<~id,'c'>,newChal),InvariantSource2(<~id,'c'>,newChal)
+    , InvariantSource1(<~id,'m'>,newChal),InvariantSource2(<~id,'m'>,newChal)
+    ]->
+    [
+      UserState( ~id, invars, ukinvars, skinvars,
+                    <h(cCSQ), newChal> , <h(mCSQ), newChal>, 'SecurityIdle' )
+    ]
+/********************************************************************************
+ * Critical ASDU functionality
+ ********************************************************************************/
+
+rule A2_C_AC_Authentication_Challenge: // g120v1
+    let invars = <AK,$USR,$OSID,~linkid>
+        AC = < h( cCSQ ), $USR, ~CD > 
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal>, <mCSQ, mChal>, 'SecurityIdle')[-]
+    , L_CounterValue(~id,h( cCSQ ) )
+    , Fr( ~CD )
+        ]
+  --[ CSQ( ~id, h( cCSQ ) )
+
+    , O_Invariant(~id, invars)
+    , L_Invariant(<~id,'sk'>, skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal>, <mCSQ, mChal>,
+                        < 'WaitForReply', < h( cCSQ ), AC > > )
+    , Out( AC )
+    ]
+
+rule A3_C_AR_Authentication_Reply: // g120v2 
+    let invars = <AK,$USR,$OSID,~linkid>
+        skinvars = <~skid, 'OK', CDSK, MDSK>
+        AC = < CSQ, $USR, CD >
+        AR = < CSQ, $USR, hmac( < CSQ, AC, $ASDU >, CDSK ) >
+        newcChal = <~ccid, ~skid, AC>
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, <mCSQ, mChal>, 'SecurityIdle' )[-]
+	, Fr(~ccid)
+    , In( AC )
+    ]
+  --[ SentASDU( ~linkid, AR, 'normal', 'control' )
+    , UsingSessKeys( CDSK, MDSK )
+    , AuthReply( AC, $ASDU, CDSK )
+
+    , U_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , InvariantSource1(<~id,'c'>,newcChal),InvariantSource2(<~id,'c'>,newcChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ 
+      UserState( ~id, invars, ukinvars, skinvars,
+                    < CSQ, newcChal >, <mCSQ, mChal>, 'SecurityIdle' )
+    , Out( AR )
+    ]
+
+rule A3_C_AR_Authentication_Aggressive:
+    let invars = <AK,$USR,$OSID,~linkid>
+        skinvars = <~skid, 'OK', CDSK, MDSK>
+		cChal = <~ccid, ~skid, AC>
+        AR = < h( cCSQ ), $USR, hmac( < 'amode', h( cCSQ ), AC, $ASDU >, CDSK ) >
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, <mCSQ, mChal>, 'SecurityIdle' )[-]
+        ]
+  --[ SentASDU( ~linkid, AR, 'aggressive', 'control' )
+    , UsingSessKeys( CDSK, MDSK )
+    , AuthReply( cChal, $ASDU, CDSK )
+
+    , U_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , Invariant(<~id,'c'>,cChal),L_Invariant(<~id,'c'>,cChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    < h( cCSQ ), cChal >, <mCSQ, mChal>, 'SecurityIdle' )
+    , Out( AR )
+    ]
+
+
+// Outstation receives MAC'd value of the ASDU (non-agressive mode)
+rule A4_receive_C_AC_of_ASDU:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		skinvars = <~skid, 'OK', CDSK, MDSK>
+		AC = < CSQ, $USR, CD >
+        AR = < CSQ, $USR, hmac( < CSQ, AC, $ASDU >, CDSK ) >
+        newcChal = <~newccid, ~skid, AC>
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal>, <mCSQ, mChal>,
+                        < 'WaitForReply', < CSQ, AC> > )[+]
+    , Fr(~newccid)
+    , In( AR )
+    ]
+  --[ AuthASDU( ~linkid, AR, 'normal', 'control' )
+    , UsingSessKeys( CDSK, MDSK )
+
+    , O_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , InvariantSource1(<~id,'c'>,newcChal),InvariantSource2(<~id,'c'>,newcChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        < CSQ, newcChal >, <mCSQ, mChal>, 'SecurityIdle' )
+    ]
+
+// Aggressive mode, can receive in either WaitForReply or SecurityIdle,
+// where waitforreply drops the previous message.
+// In security idle, we need to get the next counter value to check the received CSQ
+rule A4_idle_receive_C_AC_aggressive:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		skinvars = <~skid, 'OK', CDSK, MDSK>
+		cChal  = <~ccid, ~skid, AC>
+		AR = < h( CSQ ), $USR, hmac( < 'amode', h( CSQ ), AC, $ASDU >, CDSK ) >
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        < CSQ, cChal >, <mCSQ, mChal>, 'SecurityIdle' )[-]
+    , L_CounterValue(~id,h( CSQ ) )
+    , In( AR )
+    ]
+  --[ AuthASDU( ~linkid, AR, 'aggressive', 'control' )
+    , UsingSessKeys( CDSK, MDSK )
+    , CSQ( ~id, h( CSQ ) )
+    , InEq( AC, 'none' )
+
+    , O_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , Invariant(<~id,'c'>,cChal),L_Invariant(<~id,'c'>,cChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        < h( CSQ ), cChal >, <mCSQ, mChal>, 'SecurityIdle' ) 
+    ]
+
+rule A4_waiting_receive_C_AC_aggressive:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		skinvars = <~skid, 'OK', CDSK, MDSK>
+		cChal  = <~ccid, ~skid, AC>
+		AC = < h( CSQ ), $USR, CD >
+        AR = < h( CSQ ), $USR, hmac( < 'amode', h( CSQ ), AC, $ASDU >, CDSK ) >
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        < CSQ, cChal >, <mCSQ, mChal>,
+                        < 'WaitForReply', <chalCSQ, chalAC> > )[+]
+    , In( AR )
+    ]
+  --[ AuthASDU( ~linkid, AR, 'aggressive', 'control' )
+    , UsingSessKeys( CDSK, MDSK )
+    , InEq( AC, 'none' )
+
+    , O_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , Invariant(<~id,'c'>,cChal),L_Invariant(<~id,'c'>,cChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        < h( CSQ ), cChal >, <mCSQ, mChal>, 'SecurityIdle' )
+    ]
+
+// When timing or erroring out, we still replace the last
+// sent challenge with the more recent one.
+rule A_OutstationWaitForReply_TimeoutorError:
+    let skinvars = <~skid, 'OK', CDSK, MDSK>
+        newcChal = <~newccid, ~skid, AC>
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        < CSQ, cChal >, <mCSQ, mChal>,
+                        < 'WaitForReply', <chalCSQ, AC> > )[+]
+    , Fr(~newccid)
+	]
+  --[ O_Invariant(~id, invars)
+    , L_Invariant(<~id,'sk'>, skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , InvariantSource1(<~id,'c'>,newcChal),InvariantSource2(<~id,'c'>,newcChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <chalCSQ,newcChal>, <mCSQ, mChal>, 'SecurityIdle' )
+    ]
+
+/*************************************************
+ * Critical ASDU Protocol, Monitoring direction
+ *************************************************/
+
+rule A2_M_AC_Authentication_Challenge: // g120v1
+    let invars = <AK, $USR, $OSID, ~linkid>
+		AC = < h( mCSQ ), $USR, ~CD >
+	in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, < mCSQ, mChal >, 'SecurityIdle' )[-]
+    , L_CounterValue(~id,h( mCSQ ) )
+    , Fr( ~CD )
+	, Fr(~mcid)
+    ]
+  --[ CSQ( ~id, h( mCSQ ) )
+
+	, U_Invariant(~id, invars)
+    , L_Invariant(<~id,'sk'>, skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, < mCSQ, mChal >,
+                    < 'WaitForReply', < h( mCSQ ), AC > > )
+    , Out( AC )
+    ]
+
+
+rule A3_M_AR_Authentication_Reply:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		skinvars = <~skid, 'OK', CDSK, MDSK>
+		AC = < CSQ, $USR, CD >
+        AR = < CSQ, $USR, hmac(< CSQ, AC, $ASDU >, MDSK ) >
+		newmChal = <~mcid, ~skid, AC>
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal>, <mCSQ, mChal>, 'SecurityIdle')[-]
+    , Fr( ~mcid )
+    , In( AC )
+    ]
+  --[ SentASDU( ~linkid, AR, 'normal', 'monitor')
+    , UsingSessKeys( CDSK, MDSK )
+    , AuthReply( AC, $ASDU, MDSK )
+
+	, O_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , InvariantSource1(<~id,'m'>,newmChal)
+    , InvariantSource2(<~id,'m'>,newmChal)
+    ]->
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal>, < CSQ, newmChal>, 'SecurityIdle' )
+    , Out( AR )
+    ]
+
+rule A3_M_AR_Authentication_Aggressive:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		skinvars = <~skid, 'OK', CDSK, MDSK>
+		mChal = <~mcid, ~skid, AC>
+		AR = < h( mCSQ ), $USR, hmac( < 'amode', h( mCSQ ), AC, $ASDU >, MDSK ) >
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal>, < mCSQ, mChal >, 'SecurityIdle' )[-]
+    ]
+  --[ SentASDU( ~linkid, AR, 'aggressive', 'monitor' )
+    , UsingSessKeys( CDSK, MDSK )
+    , AuthReply( mChal, $ASDU, MDSK )
+
+	, O_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , Invariant(<~id,'m'>,mChal),L_Invariant(<~id,'m'>,mChal)
+    ]->
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal>, < h( mCSQ ), mChal >, 'SecurityIdle' )
+    , Out( AR )
+    ]
+
+
+rule A4_receive_M_AC_of_ASDU:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		skinvars = <~skid,'OK', CDSK, MDSK>
+		AC = < CSQ, $USR, CD >
+        AR = < CSQ, $USR, hmac( < CSQ, AC, $ASDU >, MDSK ) >
+        newmChal = <~newmcid, ~skid, AC>
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, < mCSQ, mChal >,
+                    < 'WaitForReply', < CSQ, AC > > )[+]
+    , Fr(~newmcid)
+    , In( AR )
+    ]
+  --[ AuthASDU( ~linkid, AR, 'normal', 'monitor' )
+    , UsingSessKeys( CDSK, MDSK )
+
+	, U_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , InvariantSource1(<~id,'m'>,newmChal)
+    , InvariantSource2(<~id,'m'>,newmChal)
+    ]->
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, < CSQ, newmChal >, 'SecurityIdle' )
+    ]
+
+rule A4_idle_receive_M_AC_aggressive:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		skinvars = <~skid, 'OK', CDSK, MDSK>
+		mChal = <~mcid, ~skid, AC>
+		AR = < h( mCSQ ), $USR, hmac( < 'amode', h( mCSQ ), AC, $ASDU >, MDSK ) >
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, < mCSQ, mChal >, 'SecurityIdle' )[-]
+    , L_CounterValue(~id,h( mCSQ ) )
+    , In( AR )
+    ]
+  --[ AuthASDU( ~linkid, AR, 'aggressive', 'monitor' )
+    , UsingSessKeys( CDSK, MDSK )
+    , CSQ( ~id, h( mCSQ ) )
+    , InEq( AC, 'none' )
+
+	, U_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , Invariant(<~id,'m'>,mChal),L_Invariant(<~id,'m'>,mChal)
+    ]->
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, < h( mCSQ ), mChal >, 'SecurityIdle' )
+    ]
+
+rule A4_waiting_receive_M_AC_aggressive:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		skinvars = <~skid, 'OK', CDSK, MDSK>
+        mChal = <~mcid, ~skid, AC>
+		AR = < h( mCSQ ), $USR, hmac( < 'amode', h( mCSQ ), AC, $ASDU >, MDSK ) >
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, < mCSQ, mChal >,
+                    < 'WaitForReply', <CSQChal,ACChal  > > )[+]
+    , In( AR )
+    ]
+  --[ AuthASDU( ~linkid, AR, 'aggressive', 'monitor' )
+    , UsingSessKeys( CDSK, MDSK )
+    , InEq( AC, 'none' )
+
+	, U_Invariant(~id, invars)
+    , Invariant(<~id,'sk'>,skinvars),L_Invariant(<~id,'sk'>,skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , Invariant(<~id,'m'>,mChal),L_Invariant(<~id,'m'>,mChal)
+    ]->
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, < h( mCSQ ), mChal >, 'SecurityIdle' )
+    ]
+
+rule A_UserWaitForReply_Timeout:
+    let skinvars = <~skid, 'OK', CDSK, MDSK>
+        newmChal = <~newmcid, ~skid, AC>
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, <mCSQ, mChal>,
+                    < 'WaitForReply', <chalCSQ, AC> > )[+]
+    , Fr(~newmcid)
+    ]
+  --[ U_Invariant(~id, invars)
+    , L_Invariant(<~id,'sk'>, skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , InvariantSource1(<~id,'m'>,newmChal)
+    , InvariantSource2(<~id,'m'>,newmChal)
+	 ]->
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, <chalCSQ, newmChal>, 'SecurityIdle' )
+    ]
+
+/*********************************************************************************
+ * Update Key Change protocol
+ *********************************************************************************/
+
+rule U2_UKCRp_Key_Change_Reply:
+    [ Fr( ~CD_b ) ]
+  --[]->
+	[ OutUpdateKeyChallenge( $USR, ~CD_b )
+    , Out( < $USR, ~CD_b > )
+    ]
+
+rule U3_U4_U5_new_update_key:
+    let invars = <~AK, $USR, $OSID, ~linkid>
+		UKCRp = < KSQ, $USR, CD_b >
+        UKC   = < KSQ, $USR, senc( < $USR, ~UK, CD_b >, ~AK ) >
+        UKCCu = hmac( < $OSID, ~CD_a, CD_b, KSQ >, ~UK )
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, <mCSQ, mChal>, 'SecurityIdle' )[-]
+    , Fr( ~CD_a )
+    , Fr( ~UK )
+    , In( UKCRp )
+    ]
+  --[ NewUpdateKey( ~linkid, ~UK )
+
+	, U_Invariant(~id, invars)
+    , L_Invariant(<~id,'sk'>, skinvars)
+    , L_Invariant(<~id,'uk'>, ukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, <mCSQ, mChal>, < 'WaitForKCC', UKCCu > )
+    , !UpdateKeyToReveal( ~linkid, ~UK )
+    , Out( < ~CD_a, UKC, UKCCu > )
+    ]
+
+
+// Since we commuted the KSQ update to U6, we should expect h(KSQ) as input
+rule U6_UKCC_Update_Key_Change_Confirmation:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		UKC = < h( KSQ ), $USR, senc( < $USR, UK, CD_b >, AK ) >
+        UKCCu = hmac( < $OSID, CD_a, CD_b, h( KSQ ) >, UK )
+        UKCCo = hmac( < $USR, CD_b, CD_a, h( KSQ ) >, UK )
+		newukinvars = <~newuid,UK>
+    in
+    [ OutstationState( ~id, invars, KSQ, ukinvars, skinvars,
+                        <cCSQ, cChal>, <mCSQ, mChal>, 'SecurityIdle' )[-]
+    , OutUpdateKeyChallenge( $USR, CD_b )[+]
+    , Fr( ~newuid )
+    , In( CD_a )
+    , In( < UKC, UKCCu > )
+    ]
+  --[ Sourced_UpdateKey( ~linkid, UK )
+
+	, O_Invariant(~id, invars)
+    , L_Invariant(<~id,'sk'>, skinvars)
+    , InvariantSource1(<~id,'uk'>,newukinvars)
+    , InvariantSource2(<~id,'uk'>,newukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ OutstationState( ~id, invars, h( KSQ ), newukinvars, skinvars,
+                        <cCSQ,cChal>, <mCSQ,mChal>, 'SecurityIdle' )
+    , Out( UKCCo )
+    ]
+
+rule U7_receive_UKCC_from_Outstation:
+    let invars = <AK, $USR, $OSID, ~linkid>
+		UKCCu = hmac( < $OSID, CD_a, CD_b, KSQ >, UK )
+        UKCCo = hmac( < $USR, CD_b, CD_a, KSQ >, UK )
+		newukinvars = <~newuid, UK>
+    in
+    [ UserState( ~id, invars, ukinvars, skinvars,
+                    <cCSQ, cChal>, <mCSQ, mChal>, < 'WaitForKCC', UKCCu > )[+]
+    , Fr( ~newuid )
+    , In( UKCCo )
+        ]
+  --[ Sourced_UpdateKey( ~linkid, UK )
+
+
+	, U_Invariant(~id, invars)
+    , L_Invariant(<~id,'sk'>, skinvars)
+    , InvariantSource1(<~id,'uk'>,newukinvars)
+    , InvariantSource2(<~id,'uk'>,newukinvars)
+    , L_Invariant(<~id,'c'>, cChal)
+    , L_Invariant(<~id,'m'>, mChal)
+    ]->
+    [ UserState( ~id, invars, newukinvars, skinvars,
+                    <cCSQ, cChal>, <mCSQ, mChal>, 'SecurityIdle' )
+    ]
+
+
+/********************************************************
+* Lemmas from here on in. These are the things we prove. 
+*********************************************************/
+
+// The U and O invariants have unique sources, so we separate them
+lemma u_invariant_sources[sources]:
+	"All id invar #i.
+		U_Invariant(id, invar) @ i ==> Ex #j. #j < #i & U_InvariantSource(id, invar) @ j"
+
+lemma o_invariant_sources[sources,heuristic=p]:
+	"All id invar #i.
+		O_Invariant(id, invar) @ i ==> Ex #j. #j < #i & O_InvariantSource(id, invar) @ j"
+
+lemma invariant_sources[sources,heuristic=p]:
+    "(All id invar #i.
+        Invariant(id, invar) @ i 
+        ==> Ex #j. #j < #i & InvariantSource1(id, invar) @ j)
+    &(All id invar #i.
+        L_Invariant(id, invar) @ i
+        ==> Ex #j. #j < #i & InvariantSource1(id,invar)[-] @ j)"
+
+lemma invariant_sources_unique[reuse]:
+    "All id invar #i #j.
+        InvariantSource1(id, invar) @ i & InvariantSource2(id, invar) @ j
+    ==> #i = #j"
+
+lemma countervalue_uniqueness[reuse, use_induction]:
+    "All id x #i #j.
+        NewCounterValue( id, x ) @ i & NewCounterValue( id, x ) @ j ==> #i = #j"
+
+lemma CSQ_Uniqueness[reuse, use_induction]:
+    "All id csq #i #j.
+        CSQ( id, csq ) @ i & CSQ( id, csq ) @ j ==> #i = #j"
+
+lemma authed_sessions_unique[reuse]:
+    "( All id ar mode mode2 direction #i #j.
+        AuthASDU( id, ar, mode, direction ) @ i 
+      & AuthASDU( id, ar, mode2, direction ) @ j ==> #i = #j )"
+
+lemma update_key_sourced[reuse, use_induction]:
+    "not( Ex ak #r. AuthorityKeyReveal( ak ) @ r)
+    ==>
+    ( All id uk #i. 
+        not( Ex #r. UpdateKeyReveal( uk ) @ r & #r < #i )
+        & Sourced_UpdateKey( id,uk ) @ i
+        ==> Ex #j. #j < #i & NewUpdateKey( id, uk ) @ j)"
+
+lemma update_key_secrecy:
+    "not( Ex ak #r. AuthorityKeyReveal( ak ) @ r )
+    ==>
+    ( All id uk #i. 
+        not( Ex #r. UpdateKeyReveal( uk ) @ r )
+        & NewUpdateKey( id, uk ) @ #i
+        ==> not( Ex #j. K( uk ) @ #j))"
+
+lemma sessionkey_secrecy_outst:
+    "not(Ex ak #r. AuthorityKeyReveal( ak ) @ r)
+    ==>
+    ( All id uk CDSK MDSK #i.
+        not( Ex #r. UpdateKeyReveal( uk ) @ r)
+        & not( Ex #r . CDSKReveal( CDSK ) @ r )
+        & not( Ex #r . MDSKReveal( MDSK ) @ r )
+        & Sourced_SKs( id, uk, CDSK, MDSK ) @ i
+         ==>  not( Ex #j . K( CDSK ) @ j ) & not( Ex #j. K( MDSK ) @ j ))"
+
+lemma sessionkeys_sourced[reuse,use_induction]:
+    "not( Ex ak #r. AuthorityKeyReveal( ak ) @ r )
+    ==>
+    ( All linkid uk CDSK MDSK #i.
+        // If the Update key wasn't revealed, the session keys were set correctly
+        not( Ex #kr. UpdateKeyReveal( uk ) @ kr & #kr < #i )
+        & Sourced_SKs( linkid, uk, CDSK, MDSK ) @ i
+        ==> Ex #j MDSK2. #j < #i & NewSKs( linkid, uk, CDSK, MDSK2 ) @ j)"
+
+lemma asdu_agreement_implies_mode_agreement[reuse]:
+    "not( Ex ak #r. AuthorityKeyReveal( ak ) @ r )
+    ==>
+    ( All linkid ar mode direction linkid2 mode2 direction2 #i #j.
+        ( All cdsk mdsk. UsingSessKeys( cdsk, mdsk ) @ i
+        ==> // The update key that was used to send out
+            // the current session keys cannot be revealed
+            ( All uk #k. UpdateKeyUsedForSKs( linkid, uk, cdsk, mdsk ) @ k 
+                ==> not( Ex #kr. UpdateKeyReveal( uk ) @ kr & #kr < #i ) )
+            // If the direction is control, then then no reveal of the current CDSK
+            & ( direction = 'control' 
+                ==> not( Ex #skr. CDSKReveal( cdsk ) @ skr & #skr < #i ) )
+            // And if the direction is monitor, then no reveal of the current MDSK
+            & ( direction = 'monitor'
+                ==> not( Ex #skr. MDSKReveal( mdsk ) @ skr & #skr < #i ) ) )
+        & AuthASDU( linkid, ar, mode, direction ) @ i
+        & SentASDU( linkid2, ar, mode2, direction2 ) @ j & #j < #i
+        ==> ( mode = mode2 ) & ( direction = direction2 ) & ( linkid = linkid2 ))"
+
+lemma asdu_aliveness[use_induction,hide_lemma=update_key_sourced]:
+    "not( Ex ak #r. AuthorityKeyReveal( ak ) @ r )
+    ==>
+    ( All linkid ar mode direction #i.
+        ( All cdsk mdsk. UsingSessKeys( cdsk, mdsk ) @ i
+        ==> // The update key that was used to send out
+            // the current session keys cannot be revealed
+            ( All uk #k. UpdateKeyUsedForSKs( linkid, uk, cdsk, mdsk ) @ k 
+                ==> not( Ex #kr. UpdateKeyReveal( uk ) @ kr & #kr < #i ) )
+            // If the direction is control, then then no reveal of the current CDSK
+            & ( direction = 'control'
+                ==> not( Ex #skr. CDSKReveal( cdsk ) @ skr & #skr < #i ) )
+            // And if the direction is monitor, then no reveal of the current MDSK
+            & ( direction = 'monitor'
+                ==> not( Ex #skr. MDSKReveal( mdsk ) @ skr & #skr < #i ) ) )
+        & AuthASDU( linkid, ar, mode, direction ) @ i
+            ==> Ex #j. SentASDU( linkid, ar, mode, direction ) @ j & j < i)"
+
+lemma asdu_injective_agreement:
+    "not( Ex ak #r. AuthorityKeyReveal(ak) @ r )
+    ==>
+    ( All linkid ar mode direction #i #j.
+        ( All cdsk mdsk. UsingSessKeys( cdsk, mdsk ) @ i
+        ==> // The update key that was used to send out
+            // the current session keys cannot be revealed
+            ( All uk #k. UpdateKeyUsedForSKs( linkid, uk, cdsk, mdsk ) @ k 
+                ==> not( Ex #kr. UpdateKeyReveal( uk ) @ kr & #kr < #i ) )
+            // If the direction is control, then then no reveal of the current CDSK
+            & ( direction = 'control'
+                ==> not( Ex #skr. CDSKReveal( cdsk ) @ skr & #skr < #i ) )
+            // And if the direction is monitor, then no reveal of the current MDSK
+            & ( direction = 'monitor'
+                ==> not( Ex #skr. MDSKReveal( mdsk ) @ skr & #skr < #i ) ) )
+        & AuthASDU( linkid, ar, mode, direction ) @ i
+        & SentASDU( linkid, ar, mode, direction ) @ j & j < i
+    ==> not( Ex #k. AuthASDU( linkid, ar, mode, direction ) @ k & not( #k = #i ) ))"
+
+end
